@@ -26,8 +26,11 @@ static const uint32_t FOURCC_01wb = FOURCC('0','1','w','b');
 static const uint32_t FOURCC_00dc = FOURCC('0','0','d','c');
 static const uint32_t FOURCC_idx1 = FOURCC('i','d','x','1');
 
-static File     audioFile;
+static FsFile   audioFile;
 static bool     fileOpen   = false;
+
+// Forward declare the shared SD object from SDManager
+extern SdFs SD;
 static bool     playing    = false;
 static bool     paused     = false;
 static int      volume     = DEFAULT_VOLUME;   // 0-100
@@ -40,7 +43,7 @@ static uint32_t audioPos   = 0;
 static int16_t* pcmBuf     = nullptr;
 static const size_t PCM_BUF_SAMPLES = AUDIO_BUFFER_SIZE / 2;
 
-static uint32_t readU32LE(File& f) {
+static uint32_t readU32LE(FsFile& f) {
     uint8_t b[4];
     f.read(b, 4);
     return (uint32_t)b[0] | ((uint32_t)b[1]<<8) |
@@ -104,7 +107,7 @@ bool init() {
 bool open(const String& aviPath) {
     if (fileOpen) audioFile.close();
 
-    audioFile = SD.open(aviPath.c_str(), FILE_READ);
+    audioFile = SD.open(aviPath.c_str(), O_RDONLY);
     if (!audioFile) return false;
 
     fileOpen = true;

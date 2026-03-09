@@ -1,8 +1,7 @@
 #include "SDManager.h"
 #include "Config.h"
-#include <SdFat.h>
 
-static SdFs SD;
+SdFs SD;   // global definition — extern'd by VideoPlayer & AudioPlayer
 static bool sdReady = false;
 
 namespace SDManager {

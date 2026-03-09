@@ -19,11 +19,12 @@
 #include "VideoPlayer.h"
 #include "Display.h"
 #include "Config.h"
+#include "SDManager.h"
 #include <SdFat.h>
 #include <esp_heap_caps.h>
+#include <TFT_eSPI.h>
 
-// ── JPEG decoder (built-in ESP32 hardware JPEG) ──────────────
-#include "esp_jpg_decode.h"
+extern TFT_eSPI tft;
 
 // ── AVI FOURCC helpers ────────────────────────────────────────
 #define FOURCC(a,b,c,d) ((uint32_t)(a)|((uint32_t)(b)<<8)|((uint32_t)(c)<<16)|((uint32_t)(d)<<24))
@@ -54,8 +55,10 @@ struct AVIMainHeader {
 #pragma pack(pop)
 
 // ── State ─────────────────────────────────────────────────────
-static File     aviFile;
+static FsFile   aviFile;
 static bool     fileOpen      = false;
+
+extern SdFs SD;
 static bool     playing       = false;
 static bool     paused        = false;
 static bool     finished      = false;
@@ -78,35 +81,12 @@ static uint32_t lastFrameTime   = 0;
 static uint8_t* jpegBuf       = nullptr;
 static size_t   jpegBufSize   = 0;
 
-// ── RGB565 output buffer (written by JPEG decoder callback) ──
-static uint16_t* rgbBuf       = nullptr;
-static uint16_t  rgbBufW      = 0;
-static uint16_t  rgbBufH      = 0;
-
 // ── Helpers ───────────────────────────────────────────────────
-static uint32_t readU32LE(File& f) {
+static uint32_t readU32LE(FsFile& f) {
     uint8_t b[4];
     f.read(b, 4);
     return (uint32_t)b[0] | ((uint32_t)b[1]<<8) |
            ((uint32_t)b[2]<<16) | ((uint32_t)b[3]<<24);
-}
-
-// ── JPEG → RGB565 callback ────────────────────────────────────
-static bool jpegWriteCB(void* arg, uint16_t x, uint16_t y,
-                        uint16_t w, uint16_t h, uint8_t* data) {
-    if (!data) return false;
-    // data is RGB888, convert to RGB565 in rgbBuf
-    for (uint16_t row = 0; row < h; row++) {
-        for (uint16_t col = 0; col < w; col++) {
-            uint32_t px = (y + row) * rgbBufW + (x + col);
-            if (px >= (uint32_t)rgbBufW * rgbBufH) continue;
-            uint8_t r = data[(row * w + col) * 3 + 0];
-            uint8_t g = data[(row * w + col) * 3 + 1];
-            uint8_t b = data[(row * w + col) * 3 + 2];
-            rgbBuf[px] = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
-        }
-    }
-    return true;
 }
 
 // ── AVI header parser ─────────────────────────────────────────
@@ -171,7 +151,7 @@ namespace VideoPlayer {
 bool open(const String& path) {
     if (fileOpen) aviFile.close();
 
-    aviFile = SD.open(path.c_str(), FILE_READ);
+    aviFile = SD.open(path.c_str(), O_RDONLY);
     if (!aviFile) {
         Serial.printf("[Video] Cannot open: %s\n", path.c_str());
         return false;
@@ -195,10 +175,6 @@ bool open(const String& path) {
         jpegBuf = (uint8_t*)heap_caps_malloc(jpegBufSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (!jpegBuf) jpegBuf = (uint8_t*)malloc(jpegBufSize);
     }
-
-    rgbBuf  = Display::getFrameBuffer();
-    rgbBufW = videoWidth;
-    rgbBufH = videoHeight;
 
     return true;
 }
@@ -264,12 +240,8 @@ void tick() {
                 aviFile.seek(aviFile.position() + chunkSize);
             } else {
                 aviFile.read(jpegBuf, chunkSize);
-                // Decode JPEG → RGB565 via callback
-                esp_jpg_decode(jpegBuf, chunkSize, JPG_SCALE_NONE,
-                               jpegWriteCB, nullptr, nullptr);
-                // Push to display (center video in screen)
-                int16_t yOff = 0;  // top of screen for video
-                Display::pushFrameBuffer(0, yOff, videoWidth, videoHeight, rgbBuf);
+                // Decode JPEG → push directly to TFT via TFT_eSPI
+                tft.drawJpg(jpegBuf, chunkSize, 0, 0, videoWidth, videoHeight);
                 currentFrame++;
             }
             currentOffset += (chunkSize + (chunkSize & 1));

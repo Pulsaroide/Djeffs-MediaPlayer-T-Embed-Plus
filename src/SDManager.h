@@ -1,6 +1,10 @@
 #pragma once
 #include <Arduino.h>
+#include <SdFat.h>
 #include <vector>
+
+// Global SD object — shared by SDManager, VideoPlayer, AudioPlayer
+extern SdFs SD;
 
 struct VideoFile {
     String path;        // Full path: /videos/myvideo.avi

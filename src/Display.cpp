@@ -15,8 +15,9 @@ void init() {
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
 
     // Backlight
-    ledcAttach(DISPLAY_BL, 5000, 8);
-    ledcWrite(DISPLAY_BL, 200);
+    ledcAttachPin(DISPLAY_BL, 0);
+    ledcSetup(0, 5000, 8);
+    ledcWrite(0, 200);
 
     // Allocate framebuffer in PSRAM
     frameBuffer = (uint16_t*)ps_malloc(MJPEG_BUFFER_SIZE);
@@ -64,7 +65,7 @@ void showError(const String& msg) {
 }
 
 void setBrightness(uint8_t level) {
-    ledcWrite(DISPLAY_BL, level);
+    ledcWrite(0, level);
 }
 
 void clear(uint16_t color) {
