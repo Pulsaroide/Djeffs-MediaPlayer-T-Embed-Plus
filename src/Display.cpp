@@ -15,8 +15,9 @@ void init() {
 
     // Backlight — FIX: nouvelle API ESP32 Arduino core 2.x
     // ledcAttachPin() + ledcSetup() supprimés → ledcAttach()
-    ledcAttach(DISPLAY_BL, 5000, 8);
-    ledcWrite(DISPLAY_BL, 200);
+    ledcSetup(0, 5000, 8);
+    ledcAttachPin(DISPLAY_BL, 0);
+    ledcWrite(0, 200);
 
     // Framebuffer en PSRAM (8MB OPI disponible)
     frameBuffer = (uint16_t*)ps_malloc(MJPEG_BUFFER_SIZE);
@@ -64,7 +65,7 @@ void showError(const String& msg) {
 
 // FIX: nouvelle API ledcWrite avec pin directement
 void setBrightness(uint8_t level) {
-    ledcWrite(DISPLAY_BL, level);
+    ledcWrite(0, level);
 }
 
 void clear(uint16_t color) {
