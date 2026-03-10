@@ -1,0 +1,125 @@
+name: Build Firmware
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:   # allow manual trigger from GitHub UI
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    name: Compile Djeff's MediaPlayer For T-Embed Plus
+
+    steps:
+      # ── 1. Checkout ─────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Cache PlatformIO ─────────────────────────────────
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          key: ${{ runner.os }}-pio-${{ hashFiles('platformio.ini') }}
+          restore-keys: |
+            ${{ runner.os }}-pio-
+
+      # ── 3. Install Python + PlatformIO ──────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+
+      # ── 4. Compile ──────────────────────────────────────────
+      - name: Build firmware
+        run: pio run -e T-Embed-CC1101
+
+      # ── 5. Rename & collect artifacts ───────────────────────
+      - name: Prepare release files
+        run: |
+          mkdir -p release
+          cp .pio/build/T-Embed-CC1101/firmware.bin      release/Djeffs-MediaPlayer-T-Embed-Plus.bin
+          cp .pio/build/T-Embed-CC1101/bootloader.bin    release/bootloader.bin    || true
+          cp .pio/build/T-Embed-CC1101/partitions.bin    release/partitions.bin    || true
+          cp partitions_16MB.csv                          release/
+
+          # Write flash instructions
+          cat > release/FLASH_INSTRUCTIONS.txt << 'EOF'
+          =================================================
+          Djeff's MediaPlayer For T-Embed Plus Flash
+          =================================================
+
+          REQUIREMENTS:
+            Python 3.x + esptool:  pip install esptool
+
+          CONNECT:
+            USB-C cable to T-Embed, hold BOOT button, press RESET
+
+          FLASH COMMAND:
+            esptool.py --chip esp32s3 --baud 921600 \
+              write_flash \
+              --flash_mode dio --flash_size 16MB \
+              0x0      bootloader.bin \
+              0x8000   partitions.bin \
+              0xe000   boot_app0.bin \
+              0x10000  Djeffs-MediaPlayer-T-Embed-Plus.bin
+
+          AFTER FLASHING:
+            1. Insert SD card with .avi files in /videos/ folder
+            2. Power on — use rotary encoder to browse & play
+
+          PREPARE VIDEOS (FFmpeg):
+            ffmpeg -i input.mp4 \
+              -vf "scale=170:270,fps=25" \
+              -vcodec mjpeg -q:v 5 \
+              -acodec pcm_s16le -ar 44100 -ac 2 \
+              /videos/output.avi
+          =================================================
+          EOF
+
+          echo "Release files:"
+          ls -lh release/
+
+      # ── 6. Upload build artifact ─────────────────────────────
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Djeffs-MediaPlayer-T-Embed-Plus-firmware
+          path: release/
+          retention-days: 30
+
+      # ── 7. Auto-release on push to main ─────────────────────
+      - name: Create GitHub Release
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: "Djeff's MediaPlayer Build #${{ github.run_number }}"
+          body: |
+            🎬 **Djeff's MediaPlayer For T-Embed Plus**
+
+            Commit: `${{ github.sha }}`
+
+            ### Flash Instructions
+            See `FLASH_INSTRUCTIONS.txt` included in the release.
+
+            ### Video Format
+            ```
+            ffmpeg -i input.mp4 \
+              -vf "scale=170:270,fps=25" \
+              -vcodec mjpeg -q:v 5 \
+              -acodec pcm_s16le -ar 44100 -ac 2 \
+              output.avi
+            ```
+          files: release/*
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

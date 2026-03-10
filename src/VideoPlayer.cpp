@@ -1,0 +1,289 @@
+/*
+ * VideoPlayer.cpp
+ * AVI/MJPEG container parser + décodeur JPEG pour ESP32-S3
+ *
+ * FIX: tft.drawJpg() → TJpgDec (décodeur intégré TFT_eSPI)
+ *      Nécessite #define SUPPORT_JPEG dans User_Setup.h TFT_eSPI
+ *      OU utilisation directe du callback TJpgDec
+ *
+ * AVI structure :
+ *   RIFF 'AVI '
+ *     LIST 'hdrl'  → avih (header principal)
+ *     LIST 'movi'  → 00dc (frames MJPEG) + 01wb (audio)
+ *     idx1         → index
+ */
+
+#include "VideoPlayer.h"
+#include "Display.h"
+#include "Config.h"
+#include "SDManager.h"
+#include <SdFat.h>
+#include <esp_heap_caps.h>
+#include <TFT_eSPI.h>
+#include <TJpg_Decoder.h>   // FIX: décodeur JPEG correct pour TFT_eSPI
+
+extern TFT_eSPI tft;
+extern SdFs SD;
+
+// ── FOURCC helpers ────────────────────────────────────────────
+#define FOURCC(a,b,c,d) ((uint32_t)(a)|((uint32_t)(b)<<8)|((uint32_t)(c)<<16)|((uint32_t)(d)<<24))
+static const uint32_t FOURCC_RIFF = FOURCC('R','I','F','F');
+static const uint32_t FOURCC_AVI  = FOURCC('A','V','I',' ');
+static const uint32_t FOURCC_LIST = FOURCC('L','I','S','T');
+static const uint32_t FOURCC_hdrl = FOURCC('h','d','r','l');
+static const uint32_t FOURCC_movi = FOURCC('m','o','v','i');
+static const uint32_t FOURCC_avih = FOURCC('a','v','i','h');
+static const uint32_t FOURCC_idx1 = FOURCC('i','d','x','1');
+static const uint32_t FOURCC_00dc = FOURCC('0','0','d','c');
+static const uint32_t FOURCC_01wb = FOURCC('0','1','w','b');
+
+#pragma pack(push,1)
+struct AVIMainHeader {
+    uint32_t dwMicroSecPerFrame;
+    uint32_t dwMaxBytesPerSec;
+    uint32_t dwPaddingGranularity;
+    uint32_t dwFlags;
+    uint32_t dwTotalFrames;
+    uint32_t dwInitialFrames;
+    uint32_t dwStreams;
+    uint32_t dwSuggestedBufferSize;
+    uint32_t dwWidth;
+    uint32_t dwHeight;
+    uint32_t dwReserved[4];
+};
+#pragma pack(pop)
+
+// ── State ─────────────────────────────────────────────────────
+static FsFile   aviFile;
+static bool     fileOpen      = false;
+static bool     playing       = false;
+static bool     paused        = false;
+static bool     finished      = false;
+
+static uint32_t moviOffset    = 0;
+static uint32_t moviSize      = 0;
+static uint32_t currentOffset = 0;
+
+static uint16_t videoFPS         = 25;
+static uint32_t totalFrames      = 0;
+static uint32_t currentFrame     = 0;
+static uint16_t videoWidth       = 170;
+static uint16_t videoHeight      = 270;
+static uint32_t durationMs       = 0;
+static uint32_t frameIntervalUs  = 40000;
+static uint32_t lastFrameTime    = 0;
+
+static uint8_t* jpegBuf    = nullptr;
+static size_t   jpegBufSize = 0;
+
+// ── Callback TJpgDec → TFT_eSPI ──────────────────────────────
+// FIX: c'est le seul moyen correct de décoder MJPEG avec TFT_eSPI
+static bool tftOutputCallback(int16_t x, int16_t y,
+                               uint16_t w, uint16_t h,
+                               uint16_t* bitmap) {
+    if (y >= tft.height()) return false;
+    tft.pushImage(x, y, w, h, bitmap);
+    return true;
+}
+
+// ── Helpers ───────────────────────────────────────────────────
+static uint32_t readU32LE(FsFile& f) {
+    uint8_t b[4];
+    f.read(b, 4);
+    return (uint32_t)b[0] | ((uint32_t)b[1]<<8) |
+           ((uint32_t)b[2]<<16) | ((uint32_t)b[3]<<24);
+}
+
+static bool parseAVIHeader() {
+    aviFile.seek(0);
+    uint32_t riff    = readU32LE(aviFile);
+    /*uint32_t fsize =*/ readU32LE(aviFile);
+    uint32_t aviTag  = readU32LE(aviFile);
+
+    if (riff != FOURCC_RIFF || aviTag != FOURCC_AVI) {
+        Serial.println("[Video] Pas un fichier AVI valide");
+        return false;
+    }
+
+    bool foundAvih = false;
+    while (aviFile.available()) {
+        uint32_t chunkId    = readU32LE(aviFile);
+        uint32_t chunkSize  = readU32LE(aviFile);
+        uint32_t chunkStart = aviFile.position();
+
+        if (chunkId == FOURCC_LIST) {
+            uint32_t listType = readU32LE(aviFile);
+            if (listType == FOURCC_movi) {
+                moviOffset    = aviFile.position();
+                moviSize      = chunkSize - 4;
+                currentOffset = 0;
+                Serial.printf("[Video] movi @ 0x%08X, size=%u\n", moviOffset, moviSize);
+                break;
+            }
+            continue;
+        }
+
+        if (chunkId == FOURCC_avih && !foundAvih) {
+            AVIMainHeader hdr;
+            aviFile.read((uint8_t*)&hdr, sizeof(hdr));
+            videoFPS        = hdr.dwMicroSecPerFrame ? (1000000 / hdr.dwMicroSecPerFrame) : 25;
+            totalFrames     = hdr.dwTotalFrames;
+            videoWidth      = hdr.dwWidth;
+            videoHeight     = hdr.dwHeight;
+            frameIntervalUs = hdr.dwMicroSecPerFrame;
+            durationMs      = (uint32_t)((uint64_t)totalFrames * hdr.dwMicroSecPerFrame / 1000);
+            foundAvih       = true;
+            Serial.printf("[Video] %dx%d @ %dfps, %u frames, %ums\n",
+                          videoWidth, videoHeight, videoFPS, totalFrames, durationMs);
+        }
+
+        uint32_t skip = chunkSize + (chunkSize & 1);
+        aviFile.seek(chunkStart + skip);
+    }
+
+    return (moviOffset > 0);
+}
+
+// ── Public API ────────────────────────────────────────────────
+namespace VideoPlayer {
+
+bool open(const String& path) {
+    if (fileOpen) aviFile.close();
+
+    aviFile = SD.open(path.c_str(), O_RDONLY);
+    if (!aviFile) {
+        Serial.printf("[Video] Impossible d'ouvrir: %s\n", path.c_str());
+        return false;
+    }
+
+    fileOpen     = true;
+    playing      = false;
+    paused       = false;
+    finished     = false;
+    currentFrame = 0;
+
+    if (!parseAVIHeader()) {
+        aviFile.close();
+        fileOpen = false;
+        return false;
+    }
+
+    // Buffer JPEG en PSRAM (priorité) — 64KB suffit pour MJPEG 170x270
+    jpegBufSize = 64 * 1024;
+    if (!jpegBuf) {
+        jpegBuf = (uint8_t*)heap_caps_malloc(jpegBufSize,
+                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!jpegBuf) jpegBuf = (uint8_t*)malloc(jpegBufSize);
+    }
+
+    // FIX: configurer TJpgDec une seule fois à l'ouverture
+    TJpgDec.setJpgScale(1);
+    TJpgDec.setCallback(tftOutputCallback);
+    TJpgDec.setSwapBytes(true);  // ESP32 = little-endian, TFT = big-endian
+
+    return true;
+}
+
+void play() {
+    if (!fileOpen) return;
+    playing       = true;
+    paused        = false;
+    finished      = false;
+    currentFrame  = 0;
+    currentOffset = 0;
+    aviFile.seek(moviOffset);
+    lastFrameTime = micros();
+}
+
+void pause()  { paused = true;  playing = false; }
+void resume() { paused = false; playing = true;  lastFrameTime = micros(); }
+
+void stop() {
+    playing  = false;
+    paused   = false;
+    finished = false;
+    if (fileOpen) { aviFile.close(); fileOpen = false; }
+    currentFrame  = 0;
+    currentOffset = 0;
+}
+
+void seekToStart() {
+    currentFrame  = 0;
+    currentOffset = 0;
+    aviFile.seek(moviOffset);
+    finished      = false;
+    lastFrameTime = micros();
+}
+
+void tick() {
+    if (!playing || paused || finished) return;
+
+    // Cadence de frames
+    uint32_t now = micros();
+    if ((now - lastFrameTime) < frameIntervalUs) return;
+    lastFrameTime = now;
+
+    while (true) {
+        if (currentOffset + 8 > moviSize) {
+            finished = true;
+            playing  = false;
+            return;
+        }
+
+        uint32_t chunkId   = readU32LE(aviFile);
+        uint32_t chunkSize = readU32LE(aviFile);
+        currentOffset += 8;
+
+        if (chunkSize == 0) continue;
+
+        if (chunkId == FOURCC_00dc) {
+            // Frame MJPEG
+            if (chunkSize > jpegBufSize) {
+                Serial.printf("[Video] Frame trop grande: %u > %u\n",
+                              chunkSize, jpegBufSize);
+                aviFile.seek(aviFile.position() + chunkSize + (chunkSize & 1));
+            } else {
+                aviFile.read(jpegBuf, chunkSize);
+                // FIX: TJpgDec.drawJpg() remplace tft.drawJpg() inexistant
+                TJpgDec.drawJpg(0, 0, jpegBuf, chunkSize);
+                currentFrame++;
+            }
+            currentOffset += (chunkSize + (chunkSize & 1));
+            return;  // une frame par tick
+
+        } else if (chunkId == FOURCC_01wb) {
+            // Audio — géré par AudioPlayer, on skip ici
+            uint32_t skip = chunkSize + (chunkSize & 1);
+            aviFile.seek(aviFile.position() + skip);
+            currentOffset += skip;
+
+        } else if (chunkId == FOURCC_idx1) {
+            finished = true;
+            playing  = false;
+            return;
+
+        } else {
+            // Chunk inconnu — skip
+            uint32_t skip = chunkSize + (chunkSize & 1);
+            aviFile.seek(aviFile.position() + skip);
+            currentOffset += skip;
+        }
+    }
+}
+
+bool isPlaying()  { return playing && !paused; }
+bool isPaused()   { return paused; }
+bool isFinished() { return finished; }
+
+uint32_t getPositionMs() {
+    if (videoFPS == 0) return 0;
+    return (uint32_t)((uint64_t)currentFrame * 1000 / videoFPS);
+}
+uint32_t getDurationMs()   { return durationMs; }
+uint16_t getFPS()          { return videoFPS; }
+uint16_t getWidth()        { return videoWidth; }
+uint16_t getHeight()       { return videoHeight; }
+uint32_t getFrameCount()   { return totalFrames; }
+uint32_t getCurrentFrame() { return currentFrame; }
+
+} // namespace VideoPlayer
