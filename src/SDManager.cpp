@@ -8,11 +8,9 @@ namespace SDManager {
 
 bool init() {
     SdSpiConfig spiConfig(SD_CS, SHARED_SPI, SD_SCK_MHZ(25));
-    // Try up to 3 times
     for (int attempt = 0; attempt < 3; attempt++) {
         if (SD.begin(spiConfig)) {
             sdReady = true;
-            // Create folders if missing
             if (!SD.exists(VIDEO_FOLDER)) SD.mkdir(VIDEO_FOLDER);
             if (!SD.exists(THUMB_FOLDER)) SD.mkdir(THUMB_FOLDER);
             Serial.printf("[SD] Init OK (attempt %d)\n", attempt + 1);
@@ -44,7 +42,6 @@ std::vector<VideoFile> getFileList() {
             vf.path = String(VIDEO_FOLDER) + "/" + name;
             vf.sizeKB = (uint32_t)(entry.fileSize() / 1024);
 
-            // Check thumbnail
             String baseName = name.substring(0, name.lastIndexOf('.'));
             vf.thumbPath = String(THUMB_FOLDER) + "/" + baseName + ".jpg";
             vf.hasThumb = SD.exists(vf.thumbPath.c_str());
@@ -63,8 +60,8 @@ bool fileExists(const String& path) {
     return sdReady && SD.exists(path.c_str());
 }
 
-File openFile(const String& path) {
-    return SD.open(path.c_str(), FILE_READ);
+FsFile openFile(const String& path) {          // ← File → FsFile
+    return SD.open(path.c_str(), O_RDONLY);    // ← FILE_READ → O_RDONLY
 }
 
 bool hasThumbnail(const String& videoPath) {
