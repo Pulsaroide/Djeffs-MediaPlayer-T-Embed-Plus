@@ -19,7 +19,7 @@ namespace SDManager {
 bool init();
 std::vector<VideoFile> getFileList();
 bool fileExists(const String& path);
-File openFile(const String& path);
+FsFile openFile(const String& path);  // ← File → FsFile
 
 // Thumbnail management
 bool hasThumbnail(const String& videoPath);
