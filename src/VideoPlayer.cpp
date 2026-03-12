@@ -1,7 +1,6 @@
 /*
- * VideoPlayer.cpp
- *
- * AVI/MJPEG container parser + JPEG decoder for ESP32-S3
+ * VideoPlayer.cpp — AVI/MJPEG decoder for T-Embed Plus
+ * Utilise JPEGDEC (pas TJpg_Decoder) pour éviter conflit SD.h vs SdFat
  */
 
 #include "VideoPlayer.h"
@@ -11,9 +10,10 @@
 #include <SdFat.h>
 #include <esp_heap_caps.h>
 #include <TFT_eSPI.h>
-#include <TJpg_Decoder.h>
+#include <JPEGDEC.h>
 
 extern TFT_eSPI tft;
+static JPEGDEC jpeg;
 
 // ── AVI FOURCC helpers ────────────────────────────────────────
 #define FOURCC(a,b,c,d) ((uint32_t)(a)|((uint32_t)(b)<<8)|((uint32_t)(c)<<16)|((uint32_t)(d)<<24))
@@ -46,7 +46,6 @@ struct AVIMainHeader {
 // ── State ─────────────────────────────────────────────────────
 static FsFile   aviFile;
 static bool     fileOpen      = false;
-
 extern SdFs SD;
 static bool     playing       = false;
 static bool     paused        = false;
@@ -56,23 +55,22 @@ static uint32_t moviOffset    = 0;
 static uint32_t moviSize      = 0;
 static uint32_t currentOffset = 0;
 
-static uint16_t videoFPS      = 25;
-static uint32_t totalFrames   = 0;
-static uint32_t currentFrame  = 0;
-static uint16_t videoWidth    = 170;
-static uint16_t videoHeight   = 270;
-static uint32_t durationMs    = 0;
-
+static uint16_t videoFPS        = 25;
+static uint32_t totalFrames     = 0;
+static uint32_t currentFrame    = 0;
+static uint16_t videoWidth      = 170;
+static uint16_t videoHeight     = 270;
+static uint32_t durationMs      = 0;
 static uint32_t frameIntervalUs = 40000;
 static uint32_t lastFrameTime   = 0;
 
-static uint8_t* jpegBuf       = nullptr;
-static size_t   jpegBufSize   = 0;
+static uint8_t* jpegBuf     = nullptr;
+static size_t   jpegBufSize = 0;
 
-// ── TJpgDec callback → pousse les pixels sur le TFT ──────────
-static bool tftOutput(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
-    tft.pushImage(x, y, w, h, bitmap);
-    return true;
+// ── JPEGDEC callback → push pixels sur TFT ───────────────────
+static int jpegDrawCallback(JPEGDRAW* pDraw) {
+    tft.pushImage(pDraw->x, pDraw->y, pDraw->iWidth, pDraw->iHeight, pDraw->pPixels);
+    return 1;
 }
 
 // ── Helpers ───────────────────────────────────────────────────
@@ -127,8 +125,7 @@ static bool parseAVIHeader() {
                           videoWidth, videoHeight, videoFPS, totalFrames, durationMs);
         }
 
-        uint32_t skip = chunkSize;
-        if (skip & 1) skip++;
+        uint32_t skip = chunkSize + (chunkSize & 1);
         aviFile.seek(chunkStart + skip);
     }
 
@@ -159,11 +156,7 @@ bool open(const String& path) {
         return false;
     }
 
-    // Init TJpgDec
-    TJpgDec.setJpgScale(1);
-    TJpgDec.setCallback(tftOutput);
-
-    // Allouer buffer JPEG en PSRAM
+    // Buffer JPEG en PSRAM
     jpegBufSize = 64 * 1024;
     if (!jpegBuf) {
         jpegBuf = (uint8_t*)heap_caps_malloc(jpegBufSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -226,12 +219,16 @@ void tick() {
 
         if (chunkId == FOURCC_00dc) {
             if (chunkSize > jpegBufSize) {
-                Serial.printf("[Video] Frame too large: %u > %u\n", chunkSize, jpegBufSize);
+                Serial.printf("[Video] Frame too large: %u\n", chunkSize);
                 aviFile.seek(aviFile.position() + chunkSize);
             } else {
                 aviFile.read(jpegBuf, chunkSize);
-                // ← TJpgDec remplace tft.drawJpg()
-                TJpgDec.drawJpg(0, 0, jpegBuf, chunkSize);
+                // Décoder JPEG via JPEGDEC (pas de conflit SD.h)
+                if (jpeg.openRAM(jpegBuf, chunkSize, jpegDrawCallback)) {
+                    jpeg.setPixelType(RGB565_BIG_ENDIAN);
+                    jpeg.decode(0, 0, 0);
+                    jpeg.close();
+                }
                 currentFrame++;
             }
             currentOffset += (chunkSize + (chunkSize & 1));
