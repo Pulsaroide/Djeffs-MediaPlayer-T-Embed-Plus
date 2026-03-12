@@ -2,18 +2,6 @@
  * VideoPlayer.cpp
  *
  * AVI/MJPEG container parser + JPEG decoder for ESP32-S3
- *
- * AVI structure:
- *   RIFF 'AVI '
- *     LIST 'hdrl'   (header)
- *       avih         main AVI header
- *       LIST 'strl'
- *         strh       stream header (vids / auds)
- *         strf       stream format
- *     LIST 'movi'   (frame data)
- *       00dc chunk   MJPEG frame
- *       01wb chunk   audio chunk
- *     idx1           index
  */
 
 #include "VideoPlayer.h"
@@ -23,6 +11,7 @@
 #include <SdFat.h>
 #include <esp_heap_caps.h>
 #include <TFT_eSPI.h>
+#include <TJpg_Decoder.h>
 
 extern TFT_eSPI tft;
 
@@ -63,9 +52,9 @@ static bool     playing       = false;
 static bool     paused        = false;
 static bool     finished      = false;
 
-static uint32_t moviOffset    = 0;   // byte offset of 'movi' data start
+static uint32_t moviOffset    = 0;
 static uint32_t moviSize      = 0;
-static uint32_t currentOffset = 0;   // current read position in movi
+static uint32_t currentOffset = 0;
 
 static uint16_t videoFPS      = 25;
 static uint32_t totalFrames   = 0;
@@ -74,12 +63,17 @@ static uint16_t videoWidth    = 170;
 static uint16_t videoHeight   = 270;
 static uint32_t durationMs    = 0;
 
-static uint32_t frameIntervalUs = 40000;  // 25fps default
+static uint32_t frameIntervalUs = 40000;
 static uint32_t lastFrameTime   = 0;
 
-// JPEG read buffer in PSRAM
 static uint8_t* jpegBuf       = nullptr;
 static size_t   jpegBufSize   = 0;
+
+// ── TJpgDec callback → pousse les pixels sur le TFT ──────────
+static bool tftOutput(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
+    tft.pushImage(x, y, w, h, bitmap);
+    return true;
+}
 
 // ── Helpers ───────────────────────────────────────────────────
 static uint32_t readU32LE(FsFile& f) {
@@ -92,7 +86,7 @@ static uint32_t readU32LE(FsFile& f) {
 // ── AVI header parser ─────────────────────────────────────────
 static bool parseAVIHeader() {
     aviFile.seek(0);
-    uint32_t riff  = readU32LE(aviFile);
+    uint32_t riff   = readU32LE(aviFile);
     uint32_t fileSize = readU32LE(aviFile);
     uint32_t aviTag = readU32LE(aviFile);
 
@@ -101,23 +95,21 @@ static bool parseAVIHeader() {
         return false;
     }
 
-    // Scan chunks until we find 'movi'
     bool foundAvih = false;
     while (aviFile.available()) {
-        uint32_t chunkId   = readU32LE(aviFile);
-        uint32_t chunkSize = readU32LE(aviFile);
+        uint32_t chunkId    = readU32LE(aviFile);
+        uint32_t chunkSize  = readU32LE(aviFile);
         uint32_t chunkStart = aviFile.position();
 
         if (chunkId == FOURCC_LIST) {
             uint32_t listType = readU32LE(aviFile);
             if (listType == FOURCC_movi) {
-                moviOffset  = aviFile.position();
-                moviSize    = chunkSize - 4;
+                moviOffset    = aviFile.position();
+                moviSize      = chunkSize - 4;
                 currentOffset = 0;
                 Serial.printf("[Video] movi @ 0x%08X, size=%u\n", moviOffset, moviSize);
                 break;
             }
-            // continue scanning inside hdrl
             continue;
         }
 
@@ -135,7 +127,6 @@ static bool parseAVIHeader() {
                           videoWidth, videoHeight, videoFPS, totalFrames, durationMs);
         }
 
-        // Skip to next chunk (aligned to 2 bytes)
         uint32_t skip = chunkSize;
         if (skip & 1) skip++;
         aviFile.seek(chunkStart + skip);
@@ -145,7 +136,6 @@ static bool parseAVIHeader() {
 }
 
 // ── Public API ────────────────────────────────────────────────
-
 namespace VideoPlayer {
 
 bool open(const String& path) {
@@ -157,10 +147,10 @@ bool open(const String& path) {
         return false;
     }
 
-    fileOpen  = true;
-    playing   = false;
-    paused    = false;
-    finished  = false;
+    fileOpen     = true;
+    playing      = false;
+    paused       = false;
+    finished     = false;
     currentFrame = 0;
 
     if (!parseAVIHeader()) {
@@ -169,8 +159,12 @@ bool open(const String& path) {
         return false;
     }
 
-    // Allocate JPEG buffer (PSRAM preferred)
-    jpegBufSize = 64 * 1024;  // 64KB should cover any MJPEG frame
+    // Init TJpgDec
+    TJpgDec.setJpgScale(1);
+    TJpgDec.setCallback(tftOutput);
+
+    // Allouer buffer JPEG en PSRAM
+    jpegBufSize = 64 * 1024;
     if (!jpegBuf) {
         jpegBuf = (uint8_t*)heap_caps_malloc(jpegBufSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (!jpegBuf) jpegBuf = (uint8_t*)malloc(jpegBufSize);
@@ -181,13 +175,12 @@ bool open(const String& path) {
 
 void play() {
     if (!fileOpen) return;
-    playing  = false;
-    paused   = false;
-    finished = false;
+    playing       = true;
+    paused        = false;
+    finished      = false;
     currentFrame  = 0;
     currentOffset = 0;
     aviFile.seek(moviOffset);
-    playing = true;
     lastFrameTime = micros();
 }
 
@@ -207,19 +200,17 @@ void seekToStart() {
     currentFrame  = 0;
     currentOffset = 0;
     aviFile.seek(moviOffset);
-    finished = false;
+    finished      = false;
     lastFrameTime = micros();
 }
 
 void tick() {
     if (!playing || paused || finished) return;
 
-    // Frame pacing
     uint32_t now = micros();
     if ((now - lastFrameTime) < frameIntervalUs) return;
     lastFrameTime = now;
 
-    // Read next chunk from movi
     while (true) {
         if (currentOffset + 8 > moviSize) {
             finished = true;
@@ -234,21 +225,19 @@ void tick() {
         if (chunkSize == 0) continue;
 
         if (chunkId == FOURCC_00dc) {
-            // Video frame — read JPEG data
             if (chunkSize > jpegBufSize) {
                 Serial.printf("[Video] Frame too large: %u > %u\n", chunkSize, jpegBufSize);
                 aviFile.seek(aviFile.position() + chunkSize);
             } else {
                 aviFile.read(jpegBuf, chunkSize);
-                // Decode JPEG → push directly to TFT via TFT_eSPI
-                tft.drawJpg(jpegBuf, chunkSize, 0, 0, videoWidth, videoHeight);
+                // ← TJpgDec remplace tft.drawJpg()
+                TJpgDec.drawJpg(0, 0, jpegBuf, chunkSize);
                 currentFrame++;
             }
             currentOffset += (chunkSize + (chunkSize & 1));
-            return;  // one frame per tick
+            return;
 
         } else if (chunkId == FOURCC_01wb) {
-            // Audio — skip here, handled by AudioPlayer
             aviFile.seek(aviFile.position() + chunkSize + (chunkSize & 1));
             currentOffset += (chunkSize + (chunkSize & 1));
 
@@ -258,7 +247,6 @@ void tick() {
             return;
 
         } else {
-            // Unknown chunk, skip
             uint32_t skip = chunkSize + (chunkSize & 1);
             aviFile.seek(aviFile.position() + skip);
             currentOffset += skip;
@@ -266,15 +254,12 @@ void tick() {
     }
 }
 
-bool isPlaying()  { return playing && !paused; }
-bool isPaused()   { return paused; }
-bool isFinished() { return finished; }
+bool isPlaying()       { return playing && !paused; }
+bool isPaused()        { return paused; }
+bool isFinished()      { return finished; }
 
-uint32_t getPositionMs() {
-    if (videoFPS == 0) return 0;
-    return (uint32_t)((uint64_t)currentFrame * 1000 / videoFPS);
-}
-uint32_t getDurationMs()  { return durationMs; }
+uint32_t getPositionMs()   { return videoFPS ? (uint32_t)((uint64_t)currentFrame * 1000 / videoFPS) : 0; }
+uint32_t getDurationMs()   { return durationMs; }
 uint16_t getFPS()          { return videoFPS; }
 uint16_t getWidth()        { return videoWidth; }
 uint16_t getHeight()       { return videoHeight; }
